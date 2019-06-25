@@ -474,3 +474,241 @@ current->files->fdt->pfd[fd]=filp;
 
 ​	relase函数，只有在当前文件的所有副本都关闭后，relase函数才会被调用。
 
+### 第三章 分配内存
+
+​	内存管理总体分两大类，物理内存管理和虚拟内存管理，物理内存管理是特定平台相关的，虚拟内存管理是特定处理器体系架构相关的
+
+#### 3.1 物理内存的管理
+
+​	内存节点 node；内存区域 zone；内存页 page
+
+​	分两部分：1.最底层实现的页面级内存管理。2.基于页面管理之上的slab管理。
+
+##### 3.1.1 内存节点node
+
+​	两种物理内存管理模型：UMA（Uniform Memory Access,一致内存访问）和NUMA（Non-Uniform Memory Access非一致内存访问）。UMA指内存空间在物理上也许不连续，但所有处理器对这些内存的访问具有相同的访问速度。NUMA多指多处理器系统，每个处理器对其本地内存访问的速度快于对其他处理器本地内存的访问速度。
+
+​	引入内存节点就是要兼容UMA和NUMA，对于UMA只有一个内存节点。源码中用struct pglist_data数据结构来表示单个内存节点。
+
+![1561130871851](1561130871851.png)
+
+##### 3.1.2 内存区域zone
+
+​	各模块对分配的内存有不同的要求，如32位x86体系架构下的DMA只能访问16MB以下的物理内存空间，linux又将每个节点管理的物理内存划分为不同的内存区域，struct zone数据结构表示每一个内存区域，其类型用zone_type表示，
+
+##### 3.1.3 内存页
+
+​	内存页式物理内存管理中的最小单位，也叫页帧。每个物理内存页对应一个struct page对象，全局struct page *mem_map存放所有物理页page对象的指针。页大小（4KB常见）取决于系统中的内存管理单元MMU(Memory Management Unit),MMU用来将虚拟空间地址转化为物理空间地址，
+
+#### 3.2 页面分配器 page allocator
+
+​	Linux系统中对物理内存进行分配的核心建立在页面级的伙伴系统之上。系统初始化期间，伙伴系统负责对物理内存页面进行跟踪，记录哪些已经被内核使用，哪些空闲。
+
+![1561131841170](1561131841170.png)
+
+Linux系统初始化期间会将虚拟地址空间的物理页面直接映射区作线性地映射到ZONE_NORMAL和ZONE_DMA，虚拟地址和物理地址之间之差一个PAGE_OFFSET即0xC0000000。如果页面分配器所分配的页面落在ZONE_HIGHMEM中，那么内核尚未对该页面进行地址映射，因此，调用者在内核虚拟地址空间的动态映射区或者固定映射区分配一个虚拟地址然后映射到该物理页面上。
+
+​	页面分配器的核心成员只有两个:alloc_pages和__get_free_pages,两者都会调用alloc_pages_node. 两者区别在后者不能在高端内存区分配页面，返回值形式也有区别。
+
+##### 3.2.1 gfp_mask
+
+​	控制分配行为的掩码，可以告诉内核应该到哪个zone中分配物理内存页面。
+​	#define GFP_ATOMIC （__GFP_HIGH）
+​	#define GFP_KERNEL （__GFP_WAIT | __GFP_IO | __GFP_FS）
+
+​	GFP_ATOMIC用于原子分配，分配内存页时不能中断当前进程或把当前进程移出调度器。驱动程序中，一般在中断处理例程或者非进程上下文的代码中使用GFP_ATOMIC掩码进行内存分配，因此两种情况下进程不能睡眠。GFP_KERNEL可能导致当前进程进入睡眠。两者中都没明确指定内存域的标识符，因此只能在ZONE_NORMAL和ZONE_DMA中分配物理页面。
+
+​	gfp_zone函数根据上述掩码指定页面分配器讲到哪个域中分配物理页面，gfp_mask：__GFP_HIGHMEM。ZONE_HIGHMEM>ZONE_NORMAL>ZONE_DMA；没指定HIGHMEM或DMA则属于__GFP_NORMAL。ZONE_NORMAL>ZONE_DMA;__GFP_DMA。只能在ZONE_DMA中分配物理页面。
+
+
+
+##### 3.2.2 alloc_pages
+
+```c
+<include/linux/gfp.h>
+#define alloc_pages(gfp_mask,order) alloc_pages_node(numa_node_id(),gfp_mask,order)
+static inline struct page *alloc_pages_node(int nid,gfp_t gfp_mask,unsigned int order)
+{
+    if(nid<0)
+        nid=numa_node_id();
+    
+    return __alloc_pages(gfp_mask,order,node_zonelist(nid,gfp_mask));
+}
+
+```
+
+__alloc_pages函数负责分配2的order次方个连续物理页面并返回起始页的struct page实例。在调用时gfp_mask没明确指明__GFP_HIGHMEM或DMA则分配的物理页面必然来自ZONE_NORMAL或ZONE_DMA，因为这两块物理内存在初始化时已经线性映射到内核虚拟地址KVA(kernel virtual address).所以获取KVA很简单
+unsigned long pfn=(unsigned long)(page-mem_map);//获取页帧号
+unsigned long pg_pa=pfn<<PAGE_SHIFT;//获得页面的物理地址
+return (void *)__va(pa_pa);//返回物理页面对应的KVA，KVA=PAGE_OFFSET+pg_pa
+如果gfp指定的是__GFP_HIGHMEM那么优先在ZONE_HIGHMEM域中分配物理页，新分配出高端物理页后，要在页表中为之建立映射关系，1.在内核的动态映射区分配一个KVA;2.通过操作页表，将1中的KVA映射到该物理页面上。
+alloc_page函数式order=0时的alloc_pages的简化形式，只分配单个页面。
+
+##### 3.2.3 __get_free_pages
+
+负责分配2的order个次方个连续的物理页面，返回起始页面所在内核线性地址。不能从高端内存中分配物理页。
+
+释放分配的页：
+__free_pages(struct page *page,unsigned int order) 参数page应该是alloc_pages返回的page对象指针，order是分配阶
+free_pages(unsigned long addr,unsigned int order) 参数addr应该是__get_free_pages返回的内核线性虚拟地址。
+
+#### 3.3 slab分配器 slab allocator
+
+Linux系统在物理页分配的基础上实现了对页以下更小内存空间进行管理的slab，slob,和slub分配器。slab分配器的基本思想是，先通过页面分配器分配出单个或者一组连续的物理页面，然后在此基础上将整块页面分割成多个相等的小内存单元。
+
+##### 3.3.1 管理slab的数据结构
+
+struct kmem_cache和struct slab
+
+```c
+struct kmem_cache{
+    ……
+	unsigned int gfporder;//指明该kmem_cache中每个slab占用的页面数量为2^gfporder个页
+    gfp_t gfpflags;//影响通过伙伴系统寻找空闲页时的行为
+    const char *name;//kmem_cache的名字，会导出到/proc/slabinfo中
+    struct list_head next;//将该kmem_cache加入到全局双向链表cache_chain中，将每个slab分配器链接起来
+    void (*ctor)(void *obj);//构造函数。当在kmem_cache中分配一个新的slab时，用来初始化slab中所有内存对象
+    struct kmeme_list3 *nodelists[MAX_NUMNODES];
+};
+
+struct kmem_list3{
+  	struct list_head slabs_partial;//将kmem_cache中所有的半空闲的slab加入到该链表中
+    struct list_head slabs_full;//将kmem_cache中所有已经满员的slab加入到该链表中
+    struct list_head slabs_free;//将kmem_cache中所有完全空闲的slab加入到该链表中
+    ……
+};
+struct slab{
+    struct list_head list;
+    unsigned long colouroff;
+    void *s_mem;
+    unsigned int inuse;//num of objs active in slab
+    kmem_bufctl_t free;
+    unsigned shrot nodeid;
+};
+```
+
+![1561345031991](1561345031991.png)
+
+struct kmem_cache用于管理其下所有的struct slab,通过三个链表成员slab_full,slab_partial,slab_free将其下所有的struct slab实例加入链表。slab_full表示链表中每一个slab所在的物理内存页都已经分配完。
+
+struct slab结构用于管理一块连续的物理页面中内存对象的分配。slab结构的实例存放位置有两种，一种是上图，将struct slab的实例放在物理页面首页的开始处；二是放在物理页面的外部（通过kmalloc函数来分配struct slab的实例）
+
+对于每一个slab分配器，都需要一个struct kmem_cache实例。slab系统尚未建立起来时，系统在初始化期间提供一个特殊的slab分配器cache_cache，专门用来分配struct kmem_cache空间。系统初始化cache_cache时伙伴系统已经完备，所以如果采用把struct slab放在页面内部的方式，这个slab分配器就可以工作了
+
+``` c
+<include/linux/slab_def.h>
+struct cache_sizes{
+	size_t cs_size;
+	struct kmem_cache *cs_cachep;
+}
+<mm/slab.c>
+struct cache_sizes  malloc_sizes[]={
+	{.cs_size=32},
+	{.cs_size=64},
+	{.cs_size=128},
+	……
+	{.cs_size=~0UL}，
+}
+```
+
+系统初始化期间,kmem_cache_init函数遍历malloc_sizes数组，对于每个元素，都调用kmem_cache_create函数在cache_cache中分配一个struct kmem_cache实例，并将实例所在的地址存放在元素cs_cachep中。
+
+![1561346522460](1561346522460.png)
+
+图中对应malloc_sizes数组中的每个元素，都产生了一个slab分配器用以分配大小为cs_size的内存空间。初始化完成后，因为还未在其上进行内存分配，所以还没有slab对象产生，kmem_cache中的slabs_full等三个链表指针都为空。malloc_sizes中每个元素有一个是cs_size表示了可分配内存空间单元大小，另一个cs_cachep指向了它的slab分配器kmem_cache，而每个slab分配器双向链接，由全局链表管理。每个slab分配器下又有slab状态链表，去管理其下的slab对象。
+
+##### 3.3.2 kmalloc与kzalloc
+
+kmalloc分配出来的内存空间在物理上是连续的，不负责把分配出的内存空间中的内容清零
+void *kmalloc(size_t size,gfp_t flags)//size是想要分配的内存空间的大小，flags分配掩码。
+函数首先找到比size大的最接近的cs_sizes对应的malloc_sizes中的元素，也就找到了该元素所对应的slab分配器的kmem_cache对象cachep。最后调用kmem_cache_alloc函数在cachep领衔的slab分配器中进行内存分配。kmem_cache_alloc大部分情况会返回cachep对应的slab分配器中一个空闲的内存对象。但万一没有这样的对象，则必须新建一个slab，意味着slab分配器需要利用下层的页面分配器来分配一段新的物理页面，__cache_alloc()->__do_cache_alloc()->cache_alloc_refill()->cache_grow()->kmem_getpages()->alloc_pages_exact_node()->__alloc_pages().最终会调用__alloc_pages去分配2^order个连续的物理页面。
+
+对于slab分配器而言，它只能在低端内存区分配物理页面。如果因内存不足导致最终分配失败，kmalloc函数将返回NULL指针。kmalloc函数最终返回低端物理内存页面所对应的的线性内核虚拟地址，而不是vmalloc区或者其他动态映射区的虚拟地址。
+
+kzalloc(size,flag)等于kmalloc(size,flags | __GFP_ZERO)所以kzalloc函数会用0来填充分配出来的内存空间。
+
+void kfree(const void *objp)函数用来释放kmalloc分配的内存
+
+##### 3.3.3 kmem_cache_create与kmem_cache_alloc
+
+slab分配器用途：提供小内存分配；作为一种内核对象的缓存。
+有些内核模块需要频繁的分配和释放相同的内核对象，对象在slab中被分配，当释放对象时，slab分配器并不会将对象占用的空间返回给伙伴系统，再次分配该对象时，可以从slab中直接得到对象的内存
+
+使用kmem_cache_create来创建内核对象的缓存。可通过/proc/slabinfo查看当前系统中有多少活动的kmem_cache
+
+sturct kmem_cache *kmem_cache_creat(const char *name,size_t size,size_t align,unsigned long flags,void (*ctor)(void *))
+参数name表示生成的kmem_cache名称，会导出到/proc/slabinfo中，传入的name指针要在kmem_cache的整个生存期内有效。参数size用来指定在缓存中分配对象的大小。ctor是个函数指针，称为kmem_cache的构造函数。
+函数的核心是通过cache_cache函数来分配kmem_cache对象，成功则返回执行kmem_cache的指针*cachep,否则NULL.新分配的kmem_cache对象最终会被加入cache_chain所表示的链表中。
+
+成功创建一个kmem_cache对象之后就可以通过kmem_cache_alloc在kmem_cache中分配对象了。
+void *kmem_cache_alloc(struct kmem_cache *cachep,gfp_t flags)
+参数cachep就是kmem_cache_create返回的对象指针。
+
+kmem_cache_destory负责把kmem_cache_create创建的kmem_cache对象销毁。而kmem_cache_free负责把kmem_cache_alloc分配的对象释放掉。
+
+#### 3.5 虚拟内存的管理
+
+主流32位处理器能寻址2^32B也就是4GB大小的虚拟地址空间（顶部1GB为内核空间，底部3GB为用户空间）。从虚拟地址到物理地址的转换通过处理器中的一个部件内存管理单元MMU(Memory Management Unit)完成。内核代码用PAGE_OFFSET宏来标示虚拟地址空间中的内核部分的起始地址。
+
+##### 3.5.1 内核虚拟地址空间构成
+
+![1561369660764](1561369660764.png)
+
+第一部分位于1GB空间开头，用于对系统物理内存的直接映射(线性映射)，内核用全局变量high_memory来表示这段空间的上界；第二部分位于中间，主要用于vmalloc函数，称为VM区或vmalloc区；第三部分位于1GB空间的尾部，用于特殊映射。白色区域为1GB虚拟地址空间中的“空洞”，空洞不作任何地址映射，主要用作安全保护，防止不正确的越界内存访问（越界如果进入空洞区，因此处没映射，对应的页表项会使得处理器产生一个异常）
+
+##### 3.5.2 vmalloc与vfree
+
+vmalloc函数分配的虚拟地址空间时连续的，但是所映射的物理地址可能是不连续的。主要对vmalloc区进行操作，它返回的地址就来自于该区域。
+
+驱动程序不推荐用vmalloc，因为:vmalloc使用效率没有kmalloc这样的函数高；物理内存大的时候，使得vmalloc区域相对变的小，对vmalloc的调用失败可能性大，当然嵌入式不明显；vmalloc分配的空间物理地址不保证连续，对要求连续的物理地址设备如DMA造成了麻烦。
+
+void *vmalloc(unsigned long size) 函数实现原理三大步：
+1.在vmalloc区分配一段连续的虚拟内存区域。2.通过伙伴系统获取物理页。3.通过对页表的操作将步骤1中分配的虚拟内存映射到步骤2中获取的物理页上。
+
+步骤1利用红黑树来解决vmalloc区中动态虚拟内存块的分配和释放，对vmalloc区中每一个分配出来的虚拟内存块，内核用struct vm_struct对象表示
+
+```c
+<include/linux/vmalloc.h>
+struct vm_struct{
+	struct vm_struct *next;//用来吧vmalloc区所有已分配的vm_struct对象构成链表，表头为全局变量struct vm_struct *vmlist.
+	void *addr;//对应虚拟内存块的起始地址，应该是页对齐
+	unsigned long size;//为虚拟内存块的大小，总是页面大小的整数倍。
+	unsigned long flags;//当前虚拟内存块映射特性标志，VM_ALLOC(当前虚拟内存块给vmalloc函数使用，映射的是实际物理内存ROM) VM_IOREMAP（当前虚拟内存块是给ioremap相关函数用，映射的是I/O空间地址，也就是设备内存）
+	struct page **pages;//被映射的物理内存页面所形成的数组首地址。
+	unsigned int nr_pages;//表示映射的物理页的数量
+	unsigned long phys_addr;//多在ioremap中使用表示映射的I/O空间起始地址，页对齐
+	void *caller;
+}
+```
+
+内核会把vmalloc函数的参数size调整到页对齐，然后再加上一个页面的大小。是为了防止可能的越界访问。因为在步骤3的页表操作时不会对最后加的这个页面虚拟地址映射实际物理页面，所以当访问此虚拟地址页面时，处理器会产生异常，和前面说的“空洞”同理
+
+步骤2中内核在调用伙伴系统获取物理内存页时，使用了GFP_KERNEL | __GFP_HIGHMEM标志，因此不可以在中断等费金成上下文中调用，而且在ZONE_HIGHMEM区中查找空闲页，因为ZONE_NORMAL区物理内存资源宝贵，主要留给kmalloc这类函数来获取连续的物理内存页面。对于vmalloc函数应该尽量使用高端的物理内存页。
+
+步骤3 不对步骤1中内存区域的末尾4KB大小部分作映射。
+
+![1561384031353](1561384031353.png)
+
+void vfree(const void *addr) 函数用来释放vmalloc获得的虚拟地址块，它执行的是vmalloc的反操作，红黑树算法释放vmalloc生成的节点，清楚内核页表中对应表项，调用伙伴系统一页一页地释放vmalloc映射的物理页，kfree掉管理数据所占用的内存。
+
+##### 3.5.3 ioremap
+
+ioremap函数式体系架构相关的，原型基本等同于 void __iomem * ioremap(unsigned long phys_addr,size_t size)
+ioremap函数及其变种用来将vmalloc区的某段虚拟内存块映射到I/O空间，其实原理与vmalloc函数基本上完全一样，都是通过在vmalloc区分配虚拟地址块，然后修改内核页表的方式将其映射到设备的内存区，也就是设备的I/O地址空间，不同的是ioremap不需要通过伙伴系统去分配物理页，因为ioremap要映射的目标地址是I/O空间，不是物理内存
+
+iounmap函数完成的工作包括将vmalloc区分配的虚拟内存块返还给vmalloc区，清除对应的页表目录项。
+
+#### 3.6 pre-CPU变量
+
+per-CPU内存分配器，只要是用在多处理器系统中，核心思想是通过为系统中每个处理器都分配一个CPU特定的变量副本，来减少多处理器并发访问时的锁定操作，借此达到提高系统性能的目的。
+
+相关链接：
+
+浅析linux内核内存管理之buddy system<https://blog.csdn.net/hsly_support/article/details/7483113>
+Linux slab 分配器剖析<https://www.ibm.com/developerworks/cn/linux/l-linux-slab-allocator/>
+
+kmalloc/kfree
+	内核空间内存分配释放接口，适合分配小块内存，虚拟和物理地址都是连续的。分配粒度是字节，返回直接映射的虚拟内核空间地址，用slab分配器。
+vmalloc/vfree
+	内核空间内存分配释放接口，可分配大块内存，虚拟地址连续，物理地址不保证连续。分配粒度是页，返回经页表映射的虚拟内核空间地址，用page allocator分配器。分配速度比kmalloc慢，因为vmalloc需要为分配的页配置页表。
+
